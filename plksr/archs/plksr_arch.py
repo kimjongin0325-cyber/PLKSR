@@ -5,233 +5,114 @@ import torch.nn.functional as F
 from basicsr.utils.registry import ARCH_REGISTRY
 
 
-# -----------------------------
-# 1) Channel Mixer (DCCM)
-# -----------------------------
-class DCCM(nn.Module):
-    """Double Channel Mixing with 1x1 conv -> GELU -> 1x1 conv."""
-    def __init__(self, dim, expansion=2.0):
+class LKConv(nn.Module):
+    """Large kernel conv wrapper with name 'conv' (for ckpt compatibility)."""
+    def __init__(self, dim: int, kernel_size: int = 13):
         super().__init__()
-        hidden_dim = int(dim * expansion)
-        self.conv1 = nn.Conv2d(dim, hidden_dim, kernel_size=1, bias=True)
-        self.act = nn.GELU()
-        self.conv2 = nn.Conv2d(hidden_dim, dim, kernel_size=1, bias=True)
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(dim, dim, kernel_size, padding=padding, bias=True)
 
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.act(out)
-        out = self.conv2(out)
-        return out
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
 
 
-# -----------------------------
-# 2) Partial Large Kernel Conv (PLK)
-# -----------------------------
-class PLKConv(nn.Module):
+class PLKBlockTiny(nn.Module):
     """
-    Partial Large Kernel Conv:
-      - split_ratio 비율만큼 채널을 large kernel conv로 처리
-      - 나머지 채널은 3x3 conv로 처리
-      - 이후 concat + 1x1 mixing
-    """
-    def __init__(self, dim, kernel_size=13, split_ratio=0.25):
-        super().__init__()
-        self.dim = dim
-        self.split_ch = int(dim * split_ratio)
-        self.remain_ch = dim - self.split_ch
-
-        padding_lk = kernel_size // 2
-
-        # Large kernel conv on a subset of channels
-        if self.split_ch > 0:
-            self.large_conv = nn.Conv2d(
-                self.split_ch, self.split_ch,
-                kernel_size=kernel_size,
-                padding=padding_lk,
-                bias=True
-            )
-        else:
-            self.large_conv = None
-
-        # Local 3x3 conv on remaining channels
-        if self.remain_ch > 0:
-            self.local_conv = nn.Conv2d(
-                self.remain_ch, self.remain_ch,
-                kernel_size=3,
-                padding=1,
-                bias=True
-            )
-        else:
-            self.local_conv = None
-
-        # Channel mixing after concatenation
-        self.mix = nn.Conv2d(dim, dim, kernel_size=1, bias=True)
-
-    def forward(self, x):
-        if self.split_ch == 0:
-            out = self.local_conv(x)
-        elif self.remain_ch == 0:
-            out = self.large_conv(x)
-        else:
-            x_lk, x_local = torch.split(
-                x, [self.split_ch, self.remain_ch], dim=1
-            )
-            if self.large_conv is not None:
-                x_lk = self.large_conv(x_lk)
-            if self.local_conv is not None:
-                x_local = self.local_conv(x_local)
-            out = torch.cat([x_lk, x_local], dim=1)
-
-        out = self.mix(out)
-        return out
-
-
-# -----------------------------
-# 3) (옵션) Element-wise / Pixel Attention
-# -----------------------------
-class ElementWiseAttention(nn.Module):
-    """Per-element (per-pixel, per-channel) attention."""
-    def __init__(self, dim, reduction=4):
-        super().__init__()
-        hidden = max(dim // reduction, 8)
-        self.conv1 = nn.Conv2d(dim, hidden, kernel_size=1, bias=True)
-        self.act = nn.GELU()
-        self.conv2 = nn.Conv2d(hidden, dim, kernel_size=1, bias=True)
-
-    def forward(self, x):
-        w = self.conv1(x)
-        w = self.act(w)
-        w = self.conv2(w)
-        w = torch.sigmoid(w)
-        return x * w
-
-
-class PixelAttention(nn.Module):
-    """Per-pixel scalar attention (PA)."""
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = nn.Conv2d(dim, 1, kernel_size=1, bias=True)
-
-    def forward(self, x):
-        w = torch.sigmoid(self.conv(x))
-        return x * w
-
-
-# -----------------------------
-# 4) PLK Block
-# -----------------------------
-class PLKBlock(nn.Module):
-    """
-    하나의 PLKSR block:
-      x -> DCCM -> PLKConv -> (EA/PA) -> 1x1 Conv -> residual add
+    PLKSR-tiny block (ckpt 구조에 맞춘 버전):
+      - channe_mixer: Conv1x1 -> GELU -> Conv1x1
+      - lk: LKConv(dim, ks)  (내부 conv 이름: 'conv')
+      - refine: Conv1x1(dim -> dim)
+      - residual add
     """
     def __init__(
         self,
-        dim,
-        kernel_size=13,
-        split_ratio=0.25,
-        ffn_expansion=2.0,
-        use_ea=False,
-        use_pa=False,
+        dim: int,
+        kernel_size: int = 13,
+        expansion: float = 2.0,
     ):
         super().__init__()
+        hidden_dim = int(dim * expansion)
 
-        self.ccm = DCCM(dim, expansion=ffn_expansion)
-        self.plk = PLKConv(dim, kernel_size=kernel_size, split_ratio=split_ratio)
+        # channe_mixer.0 / 1 / 2 로 저장되도록 Sequential 사용
+        self.channe_mixer = nn.Sequential(
+            nn.Conv2d(dim, hidden_dim, kernel_size=1, bias=True),  # .0.weight/.bias
+            nn.GELU(),                                             # .1 (no params)
+            nn.Conv2d(hidden_dim, dim, kernel_size=1, bias=True),  # .2.weight/.bias
+        )
 
-        self.use_ea = use_ea
-        self.use_pa = use_pa
+        # lk.conv.weight / lk.conv.bias
+        self.lk = LKConv(dim, kernel_size=kernel_size)
 
-        if use_ea:
-            self.ea = ElementWiseAttention(dim)
-        else:
-            self.ea = nn.Identity()
+        # refine.weight / refine.bias
+        self.refine = nn.Conv2d(dim, dim, kernel_size=1, bias=True)
 
-        if use_pa:
-            self.pa = PixelAttention(dim)
-        else:
-            self.pa = nn.Identity()
-
-        self.proj = nn.Conv2d(dim, dim, kernel_size=1, bias=True)
-
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = x
-        x = self.ccm(x)
-        x = self.plk(x)
-        x = self.ea(x)
-        x = self.pa(x)
-        x = self.proj(x)
+        x = self.channe_mixer(x)
+        x = self.lk(x)
+        x = self.refine(x)
         return x + identity
 
 
-# -----------------------------
-# 5) PLKSR Network (tiny X4 config 호환)
-# -----------------------------
 @ARCH_REGISTRY.register()
 class PLKSR(nn.Module):
     """
-    PLKSR network (BasicSR/PLKSR yaml과 호환되는 인터페이스)
+    PLKSR-tiny X4 (DF2K)와 ckpt 1:1 호환되는 구조.
 
-    yaml 예시:
-      network_g:
-        type: PLKSR
-        dim: 64
-        n_blocks: 12
-        kernel_size: 13
-        split_ratio: 0.25
-        ccm_type: DCCM
-        lk_type: PLK
-        use_pa: false
-        use_ea: false
-        upscaling_factor: 4
+    ckpt key 예:
+      feats.0.weight / bias
+      feats.1.channe_mixer.0/2.weight / bias
+      feats.1.lk.conv.weight / bias
+      feats.1.refine.weight / bias
+      ...
+      feats.12.channe_mixer...
+      feats.13.weight / bias
     """
     def __init__(
         self,
-        dim=64,
-        n_blocks=12,
-        kernel_size=13,
-        split_ratio=0.25,
-        ccm_type='DCCM',
-        lk_type='PLK',
-        use_pa=False,
-        use_ea=False,
-        upscaling_factor=4,
-        ffn_expansion=2.0,
-        **kwargs
+        dim: int = 64,
+        n_blocks: int = 12,
+        kernel_size: int = 13,
+        split_ratio: float = 0.25,   # ckpt에는 직접 쓰이진 않지만 인터페이스 유지용
+        ccm_type: str = 'DCCM',
+        lk_type: str = 'PLK',
+        use_pa: bool = False,
+        use_ea: bool = False,
+        upscaling_factor: int = 4,
+        ffn_expansion: float = 2.0,
+        **kwargs,
     ):
         super().__init__()
 
-        # yaml 호환용 (현재 구현은 DCCM + PLK만 지원)
-        assert ccm_type in ['DCCM'], f'Unsupported ccm_type: {ccm_type}'
-        assert lk_type in ['PLK'], f'Unsupported lk_type: {lk_type}'
-        assert upscaling_factor in [2, 3, 4], 'upscaling_factor must be 2, 3 or 4.'
-
+        assert upscaling_factor == 4, "현재 ckpt는 x4 전용."
         self.scale = upscaling_factor
         self.dim = dim
+        self.n_blocks = n_blocks
 
-        # 1) 입력 컨볼루션 (3 -> dim)
-        self.head = nn.Conv2d(3, dim, kernel_size=3, padding=1, bias=True)
+        # ckpt 구조에 맞게 feats 라는 리스트로 구성
+        feats = []
 
-        # 2) PLK blocks
-        blocks = []
+        # feats[0]: 입력 conv (3 -> dim)
+        feats.append(
+            nn.Conv2d(3, dim, kernel_size=3, padding=1, bias=True)
+        )
+
+        # feats[1..n_blocks]: PLKBlockTiny
         for _ in range(n_blocks):
-            blocks.append(
-                PLKBlock(
-                    dim=dim,
-                    kernel_size=kernel_size,
-                    split_ratio=split_ratio,
-                    ffn_expansion=ffn_expansion,
-                    use_ea=use_ea,
-                    use_pa=use_pa,
-                )
+            feats.append(
+                PLKBlockTiny(dim=dim, kernel_size=kernel_size, expansion=ffn_expansion)
             )
-        self.body = nn.Sequential(*blocks)
 
-        # 3) high-frequency branch: feature -> 3 * r^2 채널
+        # feats[n_blocks+1]: tail conv (dim -> 3 * r^2)
         out_channels = 3 * (self.scale ** 2)
-        self.tail = nn.Conv2d(dim, out_channels, kernel_size=3, padding=1, bias=True)
+        feats.append(
+            nn.Conv2d(dim, out_channels, kernel_size=3, padding=1, bias=True)
+        )
 
-    def forward(self, x):
+        # ModuleList 로 등록 → ckpt의 feats.* 구조와 일치
+        self.feats = nn.ModuleList(feats)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: B x 3 x H x W
         return: B x 3 x (H * r) x (W * r)
@@ -239,19 +120,28 @@ class PLKSR(nn.Module):
         b, c, h, w = x.shape
         r = self.scale
 
-        # Feature path
-        feat = self.head(x)
-        feat = self.body(feat)
-        F_h = self.tail(feat)                  # B x (3 * r^2) x H x W
+        # feats[0] : 입력 conv
+        feat = self.feats[0](x)
 
-        # LR repeat branch (F_l)
-        F_l = x.repeat(1, r * r, 1, 1)         # B x (3 * r^2) x H x W
+        # feats[1..n_blocks] : 블록 반복
+        for i in range(1, 1 + self.n_blocks):
+            feat = self.feats[i](feat)
 
-        # Merge & PixelShuffle
+        # feats[n_blocks+1] : tail conv
+        F_h = self.feats[1 + self.n_blocks](feat)  # B x (3*r^2) x H x W
+
+        # LR repeat branch
+        F_l = x.repeat(1, r * r, 1, 1)             # B x (3*r^2) x H x W
+
         F_sum = F_h + F_l
 
-        # ONNX/TensorRT 호환을 위해 F.pixel_shuffle 대신 수동 구현 가능
-        # 여기서는 nn.functional.pixel_shuffle 사용
-        out = F.pixel_shuffle(F_sum, r)        # B x 3 x (H * r) x (W * r)
+        # PixelShuffle
+        out = F_sum.view(
+            b, 3, r, r, h, w
+        ).permute(
+            0, 1, 4, 2, 5, 3
+        ).reshape(
+            b, 3, h * r, w * r
+        )
 
         return out
